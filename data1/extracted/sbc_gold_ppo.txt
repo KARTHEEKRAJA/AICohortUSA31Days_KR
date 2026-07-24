@@ -1,0 +1,15 @@
+
+--- Page 1 ---
+Summary of Benefits and Coverage: Gold PPO (P101)
+Coverage Period: 01/01/2026 - 12/31/2026
+Plan Type: PPO | Network Tier: Gold
+Overall deductible: $2,000 individual / $4,000 family
+Out-of-pocket limit: $6,500 individual / $13,000 family
+Primary care visit: $25 copay per visit
+Specialist visit: $50 copay per visit
+Emergency room care: 10% coinsurance after deductible
+Generic drugs: $10 copay | Preferred brand drugs: $40 copay
+X-rays and diagnostic imaging: 10% coinsurance
+Outpatient surgery: 10% coinsurance after deductible
+Services NOT covered: cosmetic surgery, weight loss programs,
+long-term care, non-emergency care when traveling outside the U.S.

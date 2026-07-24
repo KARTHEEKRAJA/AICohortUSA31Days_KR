@@ -1,0 +1,19 @@
+
+--- Page 1 ---
+HEALTH PLAN ENROLLMENT FORM
+
+Member Name: Jane Q. Sample
+
+Date of Birth: 04/12/1990
+
+Member ID: M2001
+
+Selected Plan: Silver HMO (P102)
+
+Coverage Start Date: 08/01/2026
+
+Dependents: 1 (child)
+
+Primary Care Physician: Dr. A. Rivera
+
+Signature: Jane Q. Sample Date: 07/20/2026
