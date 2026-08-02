@@ -1,3 +1,4 @@
+import re
 import sys
 import time
 from datetime import datetime, timezone
@@ -47,6 +48,22 @@ def add_turn(session: dict, role: str, content: str, elapsed_ms: int | None = No
     session["turns"].append(turn)
 
 
+def numbers_grounded(answer: str, context: str) -> bool:
+    """Hallucination guard: every numeric figure in the answer must appear as
+    a whole number in the retrieved context (set comparison — no substring
+    false-passes like '25' inside '250'). Catches invented copays, premiums,
+    phone numbers — Day-13 philosophy (validate outputs) applied to generation."""
+    figures = re.findall(r"\d[\d,]*(?:\.\d+)?", answer)
+    if not figures:
+        return True                      # no numeric claims -> nothing to verify
+    ctx_nums = {n.replace(",", "") for n in re.findall(r"\d[\d,]*(?:\.\d+)?", context)}
+    return all(f.replace(",", "") in ctx_nums for f in figures)
+
+
+REFUSAL_MSG = ("I don't have that information in my records. "
+               "Please contact Member Support for a definitive answer.")
+
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
@@ -79,8 +96,19 @@ def chat(req: ChatRequest) -> ChatResponse:
     try:
         result = retrieve_and_answer(req.message)
         answer = result["answer"]
-        sources = result.get("sources", [])[:5]
+        # sources: tolerate whichever key the Day-11 pipeline uses
+        sources = (result.get("sources") or result.get("chunks")
+                   or result.get("chunk_ids") or [])[:5]
+        context = str(result.get("context")
+                      or result.get("context_text") or "")
         status = "ok"
+
+        # ---- hallucination guard: numeric facts must exist in context ----
+        if context and not numbers_grounded(answer, context):
+            log.warning(f"ungrounded numbers session={req.session_id} "
+                        f"answer={answer[:120]!r}")
+            answer = REFUSAL_MSG
+            status = "ungrounded_numbers"
     except Exception as e:                      # LLM down, Chroma error, etc.
         log.error(f"pipeline failure session={req.session_id}: {type(e).__name__}: {e}")
         answer = ("I'm having trouble answering right now. Please try again "

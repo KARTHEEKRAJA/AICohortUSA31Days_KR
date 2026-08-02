@@ -9,8 +9,8 @@ classifier -> sql_lookup / vector_lookup -> retrieve (orchestrator)
 # Signals that the answer lives in the database (exact facts/numbers)
 STRUCTURED_KEYWORDS = [
     "deductible", "premium", "copay", "cost", "price", "how much",
-    "claim status", "my claim", "pending", "approved", "denied",
-    "monthly", "annual", "$", "cheapest", "under", "compare price",
+    "claim status", "my claim", "status of claim", "pending", "approved",
+    "denied", "monthly", "annual", "$", "cheapest", "under", "compare price",
 ]
 
 # Signals that the answer lives in documents (explanations/policies)
@@ -75,6 +75,12 @@ def _extract_member(q: str) -> str | None:
     m = re.search(r"\bM\d{4}\b", q, flags=re.IGNORECASE)
     return m.group(0).upper() if m else None
 
+
+def _extract_claim_id(q: str) -> str | None:
+    """Find a claim ID like C1001 or C-2031; normalize to DB form (C1001)."""
+    m = re.search(r"\bC-?\d{3,}\b", q, flags=re.IGNORECASE)
+    return m.group(0).upper().replace("-", "") if m else None
+
 def sql_lookup(question: str) -> list[dict]:
     """Route a structured question to a templated, parameterized SQL query."""
     q = question.lower()
@@ -87,10 +93,19 @@ def sql_lookup(question: str) -> list[dict]:
             "SELECT plan_name, monthly_premium, annual_deductible, copay_pct "
             "FROM plans WHERE plan_name LIKE ?", (f"{plan}%",))
 
-    # Template 2: claim status for a member
+    # Template 2a: claim status by claim ID  e.g. "status of claim C1001"
+    claim_id = _extract_claim_id(question)
+    if "claim" in q and claim_id:
+        return _run_sql(
+            "SELECT claim_id, member_id, procedure, claim_amount, status, date_filed "
+            "FROM claims WHERE claim_id = ?", (claim_id,))
+
+    # Template 2b: claim status for a member
+    # (T06 fix: member_id now SELECTed — its absence made the model unable to
+    #  confirm the member and refuse; root-caused Day 11, fixed Day 17)
     if "claim" in q and member:
         return _run_sql(
-            "SELECT claim_id, procedure, claim_amount, status, date_filed "
+            "SELECT claim_id, member_id, procedure, claim_amount, status, date_filed "
             "FROM claims WHERE member_id = ?", (member,))
 
     # Template 3: plans under a price  e.g. "under $400"
@@ -175,12 +190,18 @@ if __name__ == "__main__":
 # ---------------------------------------------------------------
 
 def _detect_plan_filter(question: str) -> dict | None:
-    """If a specific plan family is mentioned, build a metadata filter."""
+    """If a specific plan family is mentioned, build a metadata filter.
+
+    Day 17 fix: filters must NEVER exclude plan_type="all" universal chunks
+    (catalog, exclusions, claims process...). The old exact-match filter had
+    silently discarded universal knowledge whenever a plan was named — since
+    Day 9. $in keeps the plan family AND the universal chunks.
+    """
     q = question.lower()
     if "silver" in q or "bronze" in q:
-        return {"plan_type": "HMO"}     # Silver & Bronze are HMO plans
+        return {"plan_type": {"$in": ["HMO", "all"]}}   # plan family + universal
     if "gold" in q:
-        return {"plan_type": "PPO"}
+        return {"plan_type": {"$in": ["PPO", "all"]}}
     return None
 
 def retrieve(question: str) -> dict:
@@ -194,6 +215,20 @@ def retrieve(question: str) -> dict:
     if route in ("unstructured", "both") or (route == "structured" and not sql_rows):
         # vector runs for unstructured/both — AND as fallback when SQL found nothing
         chunks = vector_lookup(question, where=_detect_plan_filter(question))
+
+    # --- intent-aware FILTER (T07 fix, upgraded): "appeal" questions keep
+    #     only appeal-matching chunks (judged on section + opening text, so
+    #     chunk_0002's orphaned trailing "Appeals" header doesn't qualify).
+    #     Root cause was a Day-7 chunk-boundary bug: the appeals heading got
+    #     appended to the end of the claims-FILING chunk, so the model saw
+    #     filing steps "labeled" appeals. If nothing matches, keep all.
+    if "appeal" in question.lower():
+        appeal_chunks = [
+            c for c in chunks
+            if "appeal" in (c["section"] + " " + c["text"][:200]).lower()
+        ]
+        if appeal_chunks:
+            chunks = appeal_chunks
 
     # --- de-duplicate ---
     # 1) identical chunk ids (can't happen in one query, but guards future multi-query)
