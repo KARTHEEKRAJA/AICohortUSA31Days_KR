@@ -1,4 +1,6 @@
-"""Day 17 — Streamlit chat UI for the coverage chatbot."""
+"""Day 17 — Streamlit chat UI for the coverage chatbot.
+Day 18: consumes the backend's SSE stream — tokens render as they arrive."""
+import json
 import uuid
 from pathlib import Path
 
@@ -47,27 +49,62 @@ with st.sidebar:
     st.caption(f"member: `{MEMBER_ID}`")
 
 
-def ask_backend(message: str) -> str:
-    """POST one turn to /chat; return the answer or a friendly error."""
+def ask_backend_stream(message: str, placeholder) -> str:
+    """POST one turn to /chat with stream=True; render tokens into the
+    placeholder as they arrive. Returns the final answer text.
+
+    Day 18 mechanics:
+    - stream=True keeps the connection open; iter_lines() yields SSE lines
+    - timeout=(5, 90): 5s to CONNECT, 90s max BETWEEN chunks — a mid-stream
+      stall raises Timeout without capping total answer length
+    - pre-first-token UX: a pulsing cursor until the first token lands
+    - a "guard" event REPLACES everything streamed (post-hoc numeric guard)
+    """
+    answer = ""
+    placeholder.markdown("*Checking your coverage…* ▌")   # pre-first-token indicator
+    # (replaced by the growing answer the instant the first token arrives)
     try:
-        resp = requests.post(
+        with requests.post(
             f"{API_URL}/chat",
             json={
                 "session_id": st.session_state.session_id,
                 "member_id": MEMBER_ID,
                 "message": message,
             },
-            timeout=120,
-        )
-        resp.raise_for_status()
-        return resp.json()["answer"]
+            stream=True,
+            timeout=(5, 90),
+        ) as resp:
+            resp.raise_for_status()
+            for line in resp.iter_lines(decode_unicode=True):
+                if not line or not line.startswith("data: "):
+                    continue                       # skip keep-alives/blanks
+                event = json.loads(line[len("data: "):])
+
+                if event["type"] == "token":
+                    answer += event["text"]
+                    placeholder.markdown(answer + "▌")   # grow the bubble
+                elif event["type"] == "guard":
+                    answer = event["text"]               # guard overrides
+                    placeholder.markdown(answer + "▌")
+                elif event["type"] == "done":
+                    ttft = event.get("ttft_ms")
+                    if ttft is not None:
+                        st.caption(f"first token {ttft} ms · total {event.get('elapsed_ms')} ms")
+        placeholder.markdown(answer)               # final render, cursor off
+        return answer
     except requests.exceptions.ConnectionError:
-        return ("⚠️ I can't reach the backend at " + API_URL +
-                ". Is uvicorn running?")
+        answer = ("⚠️ I can't reach the backend at " + API_URL +
+                  ". Is uvicorn running?")
     except requests.exceptions.HTTPError as e:
-        return f"⚠️ Backend error: {e.response.status_code} — {e.response.text[:200]}"
+        answer = f"⚠️ Backend error: {e.response.status_code} — {e.response.text[:200]}"
     except requests.exceptions.Timeout:
-        return "⚠️ The backend took too long. Try again — warm requests are faster."
+        answer = (answer + "\n\n⚠️ The stream stalled mid-answer. "
+                  "Partial response shown — try again.") if answer else \
+                 "⚠️ The backend took too long to start answering. Try again."
+    except json.JSONDecodeError:
+        answer = "⚠️ Received a malformed stream event. Try again."
+    placeholder.markdown(answer)
+    return answer
 
 
 # ---- render the conversation so far ----
@@ -95,7 +132,6 @@ if prompt := st.chat_input("Ask about your coverage..."):
         contextual = f"[Member's plan: {plan_label}] {prompt}"
 
     with st.chat_message("assistant"):
-        with st.spinner("Checking your coverage..."):
-            reply = ask_backend(contextual)
-        st.markdown(reply)
+        placeholder = st.empty()                   # the growing bubble
+        reply = ask_backend_stream(contextual, placeholder)
     st.session_state.messages.append({"role": "assistant", "content": reply})

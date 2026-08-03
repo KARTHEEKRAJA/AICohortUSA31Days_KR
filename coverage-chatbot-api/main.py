@@ -8,10 +8,13 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+import json
+
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from rag_chatbot import retrieve_and_answer          # Day 11 pipeline (Day 10 retrieve() inside)
+from rag_chatbot import retrieve_and_answer, stream_answer   # Day 11 pipeline + Day 18 streaming
 
 import logging
 
@@ -53,10 +56,15 @@ def numbers_grounded(answer: str, context: str) -> bool:
     a whole number in the retrieved context (set comparison — no substring
     false-passes like '25' inside '250'). Catches invented copays, premiums,
     phone numbers — Day-13 philosophy (validate outputs) applied to generation."""
-    figures = re.findall(r"\d[\d,]*(?:\.\d+)?", answer)
+    # (?<![A-Za-z\d]) / (?![A-Za-z]) : skip digits glued to letters — P102,
+    # C1001, M1001 are IDENTIFIERS, not numeric facts (first live false
+    # positive: guard flagged "plan ID P102" because the SQL row lacked
+    # plan_id — fixed on both sides, Day 18)
+    num_re = r"(?<![A-Za-z\d])\d[\d,]*(?:\.\d+)?(?![A-Za-z])"
+    figures = re.findall(num_re, answer)
     if not figures:
         return True                      # no numeric claims -> nothing to verify
-    ctx_nums = {n.replace(",", "") for n in re.findall(r"\d[\d,]*(?:\.\d+)?", context)}
+    ctx_nums = {n.replace(",", "") for n in re.findall(num_re, context)}
     return all(f.replace(",", "") in ctx_nums for f in figures)
 
 
@@ -84,53 +92,77 @@ class ChatResponse(BaseModel):
     elapsed_ms: int
 
 
-@app.post("/chat", response_model=ChatResponse)
-def chat(req: ChatRequest) -> ChatResponse:
-    t0 = time.perf_counter()
+def _sse(payload: dict) -> str:
+    """Format one Server-Sent Events data line."""
+    return f"data: {json.dumps(payload)}\n\n"
 
-    session = get_session(req.session_id, req.member_id)     # state in
-    add_turn(session, "user", req.message)
 
-    # ---- Day 16 Step 2 + Step 6: guarded orchestration ----
-    # Day 10 retrieve() -> clean context -> Day 12 Variant E prompt -> Day 11 LLM
-    try:
-        result = retrieve_and_answer(req.message)
-        answer = result["answer"]
-        # sources: tolerate whichever key the Day-11 pipeline uses
-        sources = (result.get("sources") or result.get("chunks")
-                   or result.get("chunk_ids") or [])[:5]
-        context = str(result.get("context")
-                      or result.get("context_text") or "")
-        status = "ok"
+@app.post("/chat")
+def chat(req: ChatRequest):
+    """Day 18: /chat now streams Server-Sent Events.
 
-        # ---- hallucination guard: numeric facts must exist in context ----
-        if context and not numbers_grounded(answer, context):
-            log.warning(f"ungrounded numbers session={req.session_id} "
-                        f"answer={answer[:120]!r}")
-            answer = REFUSAL_MSG
-            status = "ungrounded_numbers"
-    except Exception as e:                      # LLM down, Chroma error, etc.
-        log.error(f"pipeline failure session={req.session_id}: {type(e).__name__}: {e}")
-        answer = ("I'm having trouble answering right now. Please try again "
-                  "in a moment, or contact Member Support.")
-        sources = []
-        status = "error"
+    Step-2 design — true token streaming: SDK chunks flow to the client as
+    they're generated. Gates (retrieval-based) still run pre-stream; the
+    numeric guard runs POST-HOC on the accumulated answer and emits a
+    "guard" correction event if it fires — the streaming trade-off,
+    documented in streaming_notes.md. New metric: ttft_ms.
+    """
+    def event_stream():
+        t0 = time.perf_counter()
+        t_first = None                       # time-to-first-token (today's metric)
 
-    elapsed = int((time.perf_counter() - t0) * 1000)
-    add_turn(session, "assistant", answer, elapsed_ms=elapsed)   # state out
-    # failure turns are recorded too — audit trails include the bad moments
+        session = get_session(req.session_id, req.member_id)     # state in
+        add_turn(session, "user", req.message)
 
-    # ---- Step 6: request-timing log ----
-    log.info(f"chat session={req.session_id} member={req.member_id} "
-             f"status={status} elapsed_ms={elapsed} turns={len(session['turns'])}")
+        yield _sse({"type": "start", "session_id": req.session_id})
 
-    return ChatResponse(
-        session_id=req.session_id,
-        answer=answer,
-        turn_count=len(session["turns"]),
-        sources=sources,
-        elapsed_ms=elapsed,
-    )
+        answer, sources, context, status = "", [], "", "ok"
+        try:
+            # ---- Day 18 Step 2: TRUE token streaming from the LLM SDK ----
+            # Gates run pre-stream inside stream_answer (retrieval-based).
+            for ev in stream_answer(req.message):
+                if ev["kind"] == "meta":
+                    sources = ev["sources"][:5]
+                    context = ev["context"]
+                    if ev["gate"]:
+                        status = ev["gate"]
+                elif ev["kind"] == "token":
+                    if t_first is None:
+                        t_first = int((time.perf_counter() - t0) * 1000)
+                    yield _sse({"type": "token", "text": ev["text"]})
+                elif ev["kind"] == "final":
+                    answer = ev["answer"]
+
+            # ---- numeric guard: POST-HOC under streaming. Tokens already
+            # left the server — if ungrounded, emit a correction event the
+            # UI uses to REPLACE the streamed text, and record the refusal.
+            # The member may have glimpsed it: streaming's honest cost. ----
+            if status == "ok" and context and not numbers_grounded(answer, context):
+                log.warning(f"ungrounded numbers session={req.session_id} "
+                            f"answer={answer[:120]!r}")
+                answer = REFUSAL_MSG
+                status = "ungrounded_numbers"
+                yield _sse({"type": "guard", "text": REFUSAL_MSG})
+        except Exception as e:                  # LLM down, Chroma error, etc.
+            log.error(f"pipeline failure session={req.session_id}: "
+                      f"{type(e).__name__}: {e}")
+            answer = ("I'm having trouble answering right now. Please try "
+                      "again in a moment, or contact Member Support.")
+            status = "error"
+            yield _sse({"type": "token", "text": answer})
+
+        elapsed = int((time.perf_counter() - t0) * 1000)
+        add_turn(session, "assistant", answer, elapsed_ms=elapsed)   # state out
+
+        log.info(f"chat session={req.session_id} member={req.member_id} "
+                 f"status={status} ttft_ms={t_first} elapsed_ms={elapsed} "
+                 f"turns={len(session['turns'])}")
+
+        yield _sse({"type": "done", "status": status, "sources": sources,
+                    "turn_count": len(session["turns"]),
+                    "ttft_ms": t_first, "elapsed_ms": elapsed})
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
 # ---- Day 16 Step 4: GET /history/{session_id} ----

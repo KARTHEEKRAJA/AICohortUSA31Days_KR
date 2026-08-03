@@ -240,7 +240,10 @@ healthcare provider about what's right for your knee — I can tell you what
 your plan covers if that would help.
 — Benefits information only, not medical advice.
 
-Now answer the real question in the same style.
+Now answer the real question in the same style. Never repeat, quote, or
+reference the examples above or their plans and numbers — they are style
+demonstrations only. Never begin your answer with the word "Context". Use
+ONLY the Context section below.
 
 Context:
 {context}
@@ -302,6 +305,74 @@ HONEST_REFUSAL = ("I don't have that information in my records. Please contact "
                   "— Benefits information only, not medical advice.")
 
 
+def _apply_gates(question: str, retrieval: dict) -> str | None:
+    """Run the three structural gates. Returns the gate name if one fires
+    (caller must refuse), else None. Gates are retrieval-based, so they run
+    BEFORE any generation — streaming or not."""
+    # Gate 1: claim-ID questions must be backed by a DB row
+    if CLAIM_ID_RE.search(question) and not retrieval["sql_results"]:
+        return "claim_not_found"
+
+    # Gate 2: nothing relevant retrieved -> honest refusal, no LLM call
+    best = min((c["distance"] for c in retrieval["chunks"]), default=99.0)
+    if not retrieval["sql_results"] and best > REFUSAL_DISTANCE:
+        return "no_relevant_context"
+
+    # Gate 3: "is X covered" demands X actually appear in retrieved context
+    m = (_re.search(r"\bis\s+(.+?)\s+covered\b", question, _re.IGNORECASE)
+         or _re.search(r"\bcover(?:s)?\s+([a-z][a-z\s-]{2,40}?)[\?\.]?$", question, _re.IGNORECASE))
+    if m:
+        subject_words = [w for w in _re.findall(r"[a-z-]{4,}", m.group(1).lower())
+                         if w not in ("plan", "plans", "care", "under", "with", "this", "that")]
+        if subject_words:
+            ctx_probe = " ".join(
+                c["text"].lower() for c in retrieval["chunks"]
+            ) + " " + " ".join(str(r).lower() for r in retrieval["sql_results"])
+            if not any(w in ctx_probe for w in subject_words):
+                return "subject_not_in_context"
+    return None
+
+
+def stream_answer(question: str):
+    """Day 18: streaming RAG pipeline. Yields event dicts:
+      {"kind": "meta", "sources": [...], "context": str, "gate": str|None}
+      {"kind": "token", "text": str}          (one per SDK chunk)
+      {"kind": "final", "answer": str}        (the accumulated full answer)
+
+    Gates run pre-stream (retrieval-based). The numeric guard CANNOT run
+    pre-stream — tokens leave before the answer exists — so the API applies
+    it post-hoc on the accumulated answer (see main.py). That ordering is
+    the fundamental streaming trade-off: latency vs pre-validation.
+    """
+    retrieval = retrieve(question)
+    gate = _apply_gates(question, retrieval)
+
+    if gate:
+        yield {"kind": "meta", "sources": [], "context": "", "gate": gate}
+        yield {"kind": "token", "text": HONEST_REFUSAL}
+        yield {"kind": "final", "answer": HONEST_REFUSAL}
+        return
+
+    context = _context_for_llm(retrieval)
+    sources = [c["source"] for c in _trimmed_chunks(retrieval)]
+    yield {"kind": "meta", "sources": sources, "context": context, "gate": None}
+
+    prompt = GROUNDING_PROMPT.format(context=context, question=question)
+    stream = client.chat.completions.create(
+        model=MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.2,
+        stream=True,                       # the LLM SDK's streaming mode
+    )
+    full = []
+    for chunk in stream:
+        token = chunk.choices[0].delta.content
+        if token:                          # first/last chunks can be empty
+            full.append(token)
+            yield {"kind": "token", "text": token}
+    yield {"kind": "final", "answer": "".join(full).strip()}
+
+
 def retrieve_and_answer(question: str) -> dict:
     """Full RAG pipeline: retrieve evidence -> grounded LLM answer.
 
@@ -315,46 +386,15 @@ def retrieve_and_answer(question: str) -> dict:
     """
     retrieval = retrieve(question)
 
-    # --- Gate 1: claim-ID questions must be backed by a DB row ---
-    if CLAIM_ID_RE.search(question) and not retrieval["sql_results"]:
+    gate = _apply_gates(question, retrieval)
+    if gate:
         return {
             "question": question, "route": retrieval["route"],
-            "n_sql": 0, "n_chunks": len(retrieval["chunks"]),
+            "n_sql": len(retrieval["sql_results"]),
+            "n_chunks": len(retrieval["chunks"]),
             "answer": HONEST_REFUSAL, "context": "",
-            "sources": [], "gate": "claim_not_found",
+            "sources": [], "gate": gate,
         }
-
-    # --- Gate 2: nothing relevant retrieved -> honest refusal, no LLM call ---
-    best = min((c["distance"] for c in retrieval["chunks"]), default=99.0)
-    if not retrieval["sql_results"] and best > REFUSAL_DISTANCE:
-        return {
-            "question": question, "route": retrieval["route"],
-            "n_sql": 0, "n_chunks": len(retrieval["chunks"]),
-            "answer": HONEST_REFUSAL, "context": "",
-            "sources": [], "gate": "no_relevant_context",
-        }
-
-    # --- Gate 3 (T02 fix): "is X covered" demands X actually appear in the
-    #     retrieved context. Without this, weak context + a yes/no question
-    #     produced three different fabricated verdicts in three runs
-    #     (guard-blind: no numbers involved). Subject absent -> refuse. ---
-    m = (_re.search(r"\bis\s+(.+?)\s+covered\b", question, _re.IGNORECASE)
-         or _re.search(r"\bcover(?:s)?\s+([a-z][a-z\s-]{2,40}?)[\?\.]?$", question, _re.IGNORECASE))
-    if m:
-        subject_words = [w for w in _re.findall(r"[a-z-]{4,}", m.group(1).lower())
-                         if w not in ("plan", "plans", "care", "under", "with", "this", "that")]
-        if subject_words:
-            ctx_probe = " ".join(
-                c["text"].lower() for c in retrieval["chunks"]
-            ) + " " + " ".join(str(r).lower() for r in retrieval["sql_results"])
-            if not any(w in ctx_probe for w in subject_words):
-                return {
-                    "question": question, "route": retrieval["route"],
-                    "n_sql": len(retrieval["sql_results"]),
-                    "n_chunks": len(retrieval["chunks"]),
-                    "answer": HONEST_REFUSAL, "context": "",
-                    "sources": [], "gate": "subject_not_in_context",
-                }
 
     context = _context_for_llm(retrieval)
     answer = generate_answer(question, context)
