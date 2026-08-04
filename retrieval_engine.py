@@ -112,8 +112,9 @@ def sql_lookup(question: str) -> list[dict]:
     price = re.search(r"\$?(\d{2,5})", q)
     if any(w in q for w in ("under", "cheaper", "less than", "cheapest")) and price:
         return _run_sql(
-            "SELECT plan_id, plan_name, monthly_premium FROM plans "
-            "WHERE monthly_premium < ? ORDER BY monthly_premium", (int(price.group(1)),))
+            "SELECT plan_id, plan_name, monthly_premium, annual_deductible, copay_pct "
+            "FROM plans WHERE monthly_premium < ? ORDER BY monthly_premium",
+            (int(price.group(1)),))   # Day 19: full row -> complete CoverageSummaryCards
 
     # Template 4: generic plan facts (no specific plan named) — return all plans
     if any(w in q for w in ("deductible", "premium", "copay", "cost", "price", "plans")):

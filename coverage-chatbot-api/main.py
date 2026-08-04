@@ -117,6 +117,8 @@ def chat(req: ChatRequest):
         yield _sse({"type": "start", "session_id": req.session_id})
 
         answer, sources, context, status = "", [], "", "ok"
+        citations = []                       # Day 19: chunk-ID provenance
+        cards = []                           # Day 19: rich cards
         try:
             # ---- Day 18 Step 2: TRUE token streaming from the LLM SDK ----
             # Gates run pre-stream inside stream_answer (retrieval-based).
@@ -124,6 +126,8 @@ def chat(req: ChatRequest):
                 if ev["kind"] == "meta":
                     sources = ev["sources"][:5]
                     context = ev["context"]
+                    citations = ev.get("citations", [])
+                    cards = ev.get("cards", [])
                     if ev["gate"]:
                         status = ev["gate"]
                 elif ev["kind"] == "token":
@@ -137,11 +141,17 @@ def chat(req: ChatRequest):
             # left the server — if ungrounded, emit a correction event the
             # UI uses to REPLACE the streamed text, and record the refusal.
             # The member may have glimpsed it: streaming's honest cost. ----
-            if status == "ok" and context and not numbers_grounded(answer, context):
+            # Day 19 fix: numbers echoed from the QUESTION are grounded too
+            # ("under $400" -> answer may say $400; context only has 150/300)
+            if (status == "ok" and context
+                    and not numbers_grounded(answer, context + "\n" + req.message)):
                 log.warning(f"ungrounded numbers session={req.session_id} "
                             f"answer={answer[:120]!r}")
                 answer = REFUSAL_MSG
                 status = "ungrounded_numbers"
+                # Day 19 fix: a refused answer must not ship rich data —
+                # cards/citations bypassing the guard contradicts the refusal
+                cards, citations = [], []
                 yield _sse({"type": "guard", "text": REFUSAL_MSG})
         except Exception as e:                  # LLM down, Chroma error, etc.
             log.error(f"pipeline failure session={req.session_id}: "
@@ -159,6 +169,7 @@ def chat(req: ChatRequest):
                  f"turns={len(session['turns'])}")
 
         yield _sse({"type": "done", "status": status, "sources": sources,
+                    "citations": citations, "cards": cards,
                     "turn_count": len(session["turns"]),
                     "ttft_ms": t_first, "elapsed_ms": elapsed})
 

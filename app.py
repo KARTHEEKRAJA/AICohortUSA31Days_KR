@@ -1,5 +1,6 @@
 """Day 17 — Streamlit chat UI for the coverage chatbot.
-Day 18: consumes the backend's SSE stream — tokens render as they arrive."""
+Day 18: consumes the backend's SSE stream — tokens render as they arrive.
+Day 19: citations expander + Pydantic rich cards under answers."""
 import json
 import uuid
 from pathlib import Path
@@ -15,6 +16,11 @@ PLANS_CSV = Path(__file__).parent / "data" / "plans.csv"
 st.set_page_config(page_title="Coverage Chatbot", page_icon="🏥")
 st.title("🏥 Coverage Chatbot")
 st.caption("Ask about plans, coverage, claims, and costs — grounded answers only.")
+
+# ---- Day 19 Probe 3 (TEMPORARY): markdown widget check — DELETE after screenshot ----
+with st.chat_message("assistant"):
+    st.markdown("Render check:\n\n- list item\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n```python\nprint('markdown ok')\n```")
+# ---- end probe ----
 
 # ---- persistence across reruns ----
 if "messages" not in st.session_state:
@@ -49,9 +55,45 @@ with st.sidebar:
     st.caption(f"member: `{MEMBER_ID}`")
 
 
-def ask_backend_stream(message: str, placeholder) -> str:
+def render_cards(cards: list) -> None:
+    """Day 19: rich result cards — rendered AFTER the stream completes.
+    Structured data never rides the token stream: a half-streamed table
+    is garbage until its closing row. Cards arrive whole, in the done
+    event, already Pydantic-validated server-side."""
+    icons = {"Approved": "\u2705", "Pending": "\u23F3", "Denied": "\u274C"}
+    for card in cards:
+        if card["card_type"] == "claim_status":
+            icon = icons.get(card["status"], "\u2139\uFE0F")
+            with st.container(border=True):
+                st.markdown(f"{icon} **Claim {card['claim_id']}** — {card['status']}")
+                c1, c2 = st.columns(2)
+                c1.metric("Amount", f"${card['amount']:,.2f}")
+                c2.metric("Filed", card["date"])
+        elif card["card_type"] == "coverage_summary":
+            with st.container(border=True):
+                badge = "\U0001F7E2 Active" if card["covered"] else "\U0001F534 Not covered"
+                st.markdown(f"**{card['plan_name']}** · {badge}")
+                c1, c2 = st.columns(2)
+                ded = card["deductible"]
+                cop = card["copay"]
+                c1.metric("Deductible", f"${ded:,.0f}" if ded is not None else "\u2014")
+                c2.metric("Copay", f"{cop:.0f}%" if cop is not None else "\u2014")
+
+
+def render_citations(citations: list) -> None:
+    """Day 19: expandable Policy-sources section — numbered, chunk-ID first.
+    An expander under the FINISHED answer, not footnotes inside it: streamed
+    markdown re-renders on every token, so inline anchors flicker/break."""
+    if not citations:
+        return
+    with st.expander(f"\U0001F4DA Policy sources ({len(citations)})"):
+        for i, c in enumerate(citations, 1):
+            st.markdown(f"**[{i}]** `{c['id']}` — {c['section']} · _{c['source']}_")
+
+
+def ask_backend_stream(message: str, placeholder) -> tuple[str, list, list]:
     """POST one turn to /chat with stream=True; render tokens into the
-    placeholder as they arrive. Returns the final answer text.
+    placeholder as they arrive. Returns (answer text, citations, cards).
 
     Day 18 mechanics:
     - stream=True keeps the connection open; iter_lines() yields SSE lines
@@ -61,6 +103,8 @@ def ask_backend_stream(message: str, placeholder) -> str:
     - a "guard" event REPLACES everything streamed (post-hoc numeric guard)
     """
     answer = ""
+    citations = []
+    cards = []
     placeholder.markdown("*Checking your coverage…* ▌")   # pre-first-token indicator
     # (replaced by the growing answer the instant the first token arrives)
     try:
@@ -87,11 +131,13 @@ def ask_backend_stream(message: str, placeholder) -> str:
                     answer = event["text"]               # guard overrides
                     placeholder.markdown(answer + "▌")
                 elif event["type"] == "done":
+                    citations = event.get("citations", [])
+                    cards = event.get("cards", [])
                     ttft = event.get("ttft_ms")
                     if ttft is not None:
                         st.caption(f"first token {ttft} ms · total {event.get('elapsed_ms')} ms")
         placeholder.markdown(answer)               # final render, cursor off
-        return answer
+        return answer, citations, cards
     except requests.exceptions.ConnectionError:
         answer = ("⚠️ I can't reach the backend at " + API_URL +
                   ". Is uvicorn running?")
@@ -104,13 +150,15 @@ def ask_backend_stream(message: str, placeholder) -> str:
     except json.JSONDecodeError:
         answer = "⚠️ Received a malformed stream event. Try again."
     placeholder.markdown(answer)
-    return answer
+    return answer, citations, cards
 
 
 # ---- render the conversation so far ----
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
+        render_cards(msg.get("cards", []))
+        render_citations(msg.get("citations", []))
 
 # ---- input ----
 if prompt := st.chat_input("Ask about your coverage..."):
@@ -124,7 +172,11 @@ if prompt := st.chat_input("Ask about your coverage..."):
     # answer — the injected plan biased retrieval AND the model's topic)
     plan_words = ("gold", "silver", "bronze", "p101", "p102", "p103")
     catalog_words = ("plans do you", "what plans", "which plans", "all plans",
-                     "plans are", "plans available", "available plans", "offer")
+                     "plans are", "plans available", "available plans", "offer",
+                     "compare", "comparison", "the plans", "difference between")
+    # injection v3: comparison/cross-plan questions must not inherit MY plan
+    # (v2 fixed catalog hijack; Day 19 found the same disease on "compare
+    #  the plans" — injected Gold turned a comparison into a one-row table)
     p = prompt.lower()
     if any(w in p for w in plan_words) or any(w in p for w in catalog_words):
         contextual = prompt                                # don't interfere
@@ -133,5 +185,9 @@ if prompt := st.chat_input("Ask about your coverage..."):
 
     with st.chat_message("assistant"):
         placeholder = st.empty()                   # the growing bubble
-        reply = ask_backend_stream(contextual, placeholder)
-    st.session_state.messages.append({"role": "assistant", "content": reply})
+        reply, citations, cards = ask_backend_stream(contextual, placeholder)
+        render_cards(cards)
+        render_citations(citations)
+    st.session_state.messages.append(
+        {"role": "assistant", "content": reply, "citations": citations,
+         "cards": cards})

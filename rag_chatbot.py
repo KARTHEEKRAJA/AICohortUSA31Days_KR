@@ -196,6 +196,7 @@ provenance for API consumers).
 """
 from openai import OpenAI
 from retrieval_engine import retrieve, TEST_QUESTIONS   # Day 10's engine + harness questions
+from response_cards import build_cards   # Day 19: Pydantic-validated rich cards
 
 client = OpenAI(
     base_url="http://localhost:11434/v1",
@@ -296,6 +297,20 @@ def _context_for_llm(retrieval: dict) -> str:
     return "\n\n".join(parts) if parts else "(no relevant information found)"
 
 
+def _citations(retrieval: dict) -> list[dict]:
+    """Day 19: which chunks actually entered the context — tracked, not
+    model-claimed. A citation the model writes can be hallucinated; a
+    citation the pipeline records cannot."""
+    cites = [
+        {"id": c["id"], "section": c["section"], "source": c["source"]}
+        for c in _trimmed_chunks(retrieval)
+    ]
+    if retrieval["sql_results"]:                     # DB facts are sources too
+        cites.append({"id": f"coverage.db ({len(retrieval['sql_results'])} rows)",
+                      "section": "database", "source": "coverage.db"})
+    return cites
+
+
 import re as _re
 
 CLAIM_ID_RE = _re.compile(r"\bC-?\d{3,}\b", _re.IGNORECASE)
@@ -348,14 +363,17 @@ def stream_answer(question: str):
     gate = _apply_gates(question, retrieval)
 
     if gate:
-        yield {"kind": "meta", "sources": [], "context": "", "gate": gate}
+        yield {"kind": "meta", "sources": [], "context": "", "gate": gate,
+               "citations": [], "cards": []}
         yield {"kind": "token", "text": HONEST_REFUSAL}
         yield {"kind": "final", "answer": HONEST_REFUSAL}
         return
 
     context = _context_for_llm(retrieval)
     sources = [c["source"] for c in _trimmed_chunks(retrieval)]
-    yield {"kind": "meta", "sources": sources, "context": context, "gate": None}
+    yield {"kind": "meta", "sources": sources, "context": context, "gate": None,
+           "citations": _citations(retrieval),
+           "cards": build_cards(retrieval["sql_results"])}
 
     prompt = GROUNDING_PROMPT.format(context=context, question=question)
     stream = client.chat.completions.create(
@@ -393,7 +411,7 @@ def retrieve_and_answer(question: str) -> dict:
             "n_sql": len(retrieval["sql_results"]),
             "n_chunks": len(retrieval["chunks"]),
             "answer": HONEST_REFUSAL, "context": "",
-            "sources": [], "gate": gate,
+            "sources": [], "citations": [], "cards": [], "gate": gate,
         }
 
     context = _context_for_llm(retrieval)
@@ -406,6 +424,8 @@ def retrieve_and_answer(question: str) -> dict:
         "answer": answer,
         "context": context,                                     # for the API's hallucination guard
         "sources": [c["source"] for c in _trimmed_chunks(retrieval)],  # provenance for API consumers
+        "citations": _citations(retrieval),   # Day 19: chunk-ID provenance
+        "cards": build_cards(retrieval["sql_results"]),  # Day 19: rich cards
     }
 
 
