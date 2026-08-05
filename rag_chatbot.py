@@ -348,7 +348,37 @@ def _apply_gates(question: str, retrieval: dict) -> str | None:
     return None
 
 
-def stream_answer(question: str):
+SUMMARIZE_PROMPT = """Condense this customer-support conversation into a short
+factual summary (5 sentences max). STRICT RULES:
+- Include ONLY facts actually stated in the conversation.
+- Keep plan names, dollar amounts, percentages and claim IDs EXACTLY as written.
+- If the member specified a plan, the summary MUST name it.
+- Do not add advice, opinions, or any information not present below.
+
+Conversation:
+{history}
+
+Summary:"""
+
+
+def summarize_history(history_text: str, prior_summary: str | None = None) -> str:
+    """Day 20 Step 4: ONE LLM call that compresses old turns. The summary
+    is a new hallucination surface — it gets re-injected into every future
+    prompt as truth — so the prompt is Variant-E strict: stated facts only,
+    figures verbatim. Prior summary is folded in so memory chains."""
+    body = history_text
+    if prior_summary:
+        body = f"Earlier summary: {prior_summary}\n{history_text}"
+    resp = client.chat.completions.create(
+        model=MODEL,
+        messages=[{"role": "user",
+                   "content": SUMMARIZE_PROMPT.format(history=body)}],
+        temperature=0.1,
+    )
+    return resp.choices[0].message.content.strip()
+
+
+def stream_answer(question: str, history_text: str | None = None):
     """Day 18: streaming RAG pipeline. Yields event dicts:
       {"kind": "meta", "sources": [...], "context": str, "gate": str|None}
       {"kind": "token", "text": str}          (one per SDK chunk)
@@ -375,7 +405,15 @@ def stream_answer(question: str):
            "citations": _citations(retrieval),
            "cards": build_cards(retrieval["sql_results"])}
 
-    prompt = GROUNDING_PROMPT.format(context=context, question=question)
+    # Day 20 Step 3: prior turns ride inside the question slot — reference
+    # material for follow-ups ("what about MY deductible"), clearly fenced
+    # so Variant E grounding rules still own the answer
+    if history_text:
+        question_block = ("Previous conversation (reference only):\n"
+                          f"{history_text}\n\nCurrent question: {question}")
+    else:
+        question_block = question
+    prompt = GROUNDING_PROMPT.format(context=context, question=question_block)
     stream = client.chat.completions.create(
         model=MODEL,
         messages=[{"role": "user", "content": prompt}],

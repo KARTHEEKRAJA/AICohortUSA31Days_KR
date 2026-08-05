@@ -17,11 +17,6 @@ st.set_page_config(page_title="Coverage Chatbot", page_icon="🏥")
 st.title("🏥 Coverage Chatbot")
 st.caption("Ask about plans, coverage, claims, and costs — grounded answers only.")
 
-# ---- Day 19 Probe 3 (TEMPORARY): markdown widget check — DELETE after screenshot ----
-with st.chat_message("assistant"):
-    st.markdown("Render check:\n\n- list item\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n```python\nprint('markdown ok')\n```")
-# ---- end probe ----
-
 # ---- persistence across reruns ----
 if "messages" not in st.session_state:
     st.session_state.messages = []
@@ -91,7 +86,7 @@ def render_citations(citations: list) -> None:
             st.markdown(f"**[{i}]** `{c['id']}` — {c['section']} · _{c['source']}_")
 
 
-def ask_backend_stream(message: str, placeholder) -> tuple[str, list, list]:
+def ask_backend_stream(message: str, placeholder, plan_id: str | None = None) -> tuple[str, list, list]:
     """POST one turn to /chat with stream=True; render tokens into the
     placeholder as they arrive. Returns (answer text, citations, cards).
 
@@ -114,6 +109,7 @@ def ask_backend_stream(message: str, placeholder) -> tuple[str, list, list]:
                 "session_id": st.session_state.session_id,
                 "member_id": MEMBER_ID,
                 "message": message,
+                "plan_id": plan_id,        # Day 20: plan is a field, not a prefix
             },
             stream=True,
             timeout=(5, 90),
@@ -170,22 +166,15 @@ if prompt := st.chat_input("Ask about your coverage..."):
     # (cross-plan fix) OR is a catalog/discovery question about all plans
     # (injection was hijacking "what plans do you offer" into a my-plan
     # answer — the injected plan biased retrieval AND the model's topic)
-    plan_words = ("gold", "silver", "bronze", "p101", "p102", "p103")
-    catalog_words = ("plans do you", "what plans", "which plans", "all plans",
-                     "plans are", "plans available", "available plans", "offer",
-                     "compare", "comparison", "the plans", "difference between")
-    # injection v3: comparison/cross-plan questions must not inherit MY plan
-    # (v2 fixed catalog hijack; Day 19 found the same disease on "compare
-    #  the plans" — injected Gold turned a comparison into a one-row table)
-    p = prompt.lower()
-    if any(w in p for w in plan_words) or any(w in p for w in catalog_words):
-        contextual = prompt                                # don't interfere
-    else:
-        contextual = f"[Member's plan: {plan_label}] {prompt}"
+    # Day 20: injection moved SERVER-SIDE (v4). The client sends the raw
+    # message + plan_id field; memory persists clean member words, and the
+    # server decides injection with the same v3 skip rules. (v2 fixed the
+    # catalog hijack, v3 the comparison hijack, v4 ends DB pollution.)
+    plan_id = plan_label.split("(")[-1].rstrip(")")        # "Gold PPO (P101)" -> P101
 
     with st.chat_message("assistant"):
         placeholder = st.empty()                   # the growing bubble
-        reply, citations, cards = ask_backend_stream(contextual, placeholder)
+        reply, citations, cards = ask_backend_stream(prompt, placeholder, plan_id)
         render_cards(cards)
         render_citations(citations)
     st.session_state.messages.append(
